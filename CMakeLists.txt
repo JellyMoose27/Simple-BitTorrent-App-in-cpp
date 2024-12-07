@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.13)
 
 project(bittorrent-starter-cpp)
 
+# Ensure vcpkg toolchain is being used
+if(NOT CMAKE_TOOLCHAIN_FILE)
+  set(CMAKE_TOOLCHAIN_FILE "C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Toolchain file for vcpkg")
+endif()
+
 file(GLOB_RECURSE SOURCE_FILES src/*.cpp src/*.hpp)
 
 set(CMAKE_CXX_STANDARD 23) # Enable the C++23 standard
@@ -9,5 +14,4 @@ set(CMAKE_CXX_STANDARD 23) # Enable the C++23 standard
 add_executable(bittorrent ${SOURCE_FILES})
 
 find_package(CURL REQUIRED)
-include_directories(${CURL_INCLUDE_DIRS})
-target_link_libraries(bittorrent PRIVATE ${CURL_LIBRARIES})
+target_link_libraries(bittorrent PRIVATE CURL::libcurl)
