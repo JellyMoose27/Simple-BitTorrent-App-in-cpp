@@ -68,6 +68,29 @@ json decode_bencoded_list(const std::string& encoded_value, size_t& index) {
     return list;
 }
 
+json decode_bencoded_dict(const std::string& encoded_value, size_t& index)
+{
+    index++;
+    json res = json::object();
+    // skip the 'd'
+    while(encoded_value[index] != 'e')
+    {
+        /*
+        d<key1><value1>...<keyN><valueN>
+        Example "d3:foo3:bare"
+        foo is key, bar is value
+
+        lexicographical order: a generalization of the alphabetical order of the dictionaries to sequences of ordered symbols or, 
+        more generally, of elements of a totally ordered set. 
+        */
+        json key = decode_bencoded_value(encoded_value, index);
+        json value = decode_bencoded_value(encoded_value, index);
+        res[key.get<std::string>()] = value;
+    }
+    index++;
+    return res;
+}
+
 json decode_bencoded_value(const std::string& encoded_value, size_t& index)
 {
     if (std::isdigit(encoded_value[index]))
@@ -88,7 +111,7 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index)
     else if (encoded_value[index] == 'd')
     {
         // Example: "d3:foo3:bar5:helloi52ee" -> {"foo":"bar", "hello":"52"}
-        // return decode_bencoded_dict(encoded_value, index);
+        return decode_bencoded_dict(encoded_value, index);
     }
     else
     {
