@@ -3,8 +3,11 @@
 #include <vector>
 #include <cctype>
 #include <cstdlib>
-
+#include <fstream>
+#include <array>
+#include <cstring>
 #include "lib/nlohmann/json.hpp"
+#include "lib/sha1.hpp"
 
 using json = nlohmann::json;
 
@@ -119,6 +122,104 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index)
     }
 }
 
+void parse_torrent(const std::string& filePath)
+{
+    std::string fileContent = read_file(filePath);
+    json decoded_torrent = decode_bencoded_value(fileContent);
+
+    // bencode the torrent
+    std::string bencoded_info = json_to_bencode(decoded_torrent["info"]);
+
+    // calculate the info hash
+    SHA1 sha1;
+    sha1.update(bencoded_info);
+    std::string infoHash = sha1.final();
+
+    // announceURL
+    std::string trackerURL = decoded_torrent["announce"];
+    
+    // length
+    int length = decoded_torrent["info"]["length"];
+
+    // piece length
+    int pieceLength = decoded_torrent["info"]["piece length"];
+    
+    std::cout << "Tracker URL: " << trackerURL << std::endl;
+    std::cout << "Length: " << length << std::endl;
+    std::cout << "Info Hash: " << infoHash << std::endl;
+    std::cout << "Piece Length: " << pieceLength << std::endl;
+    std::cout << "Piece Hashes: " << std::endl;
+
+    // concatenated SHA-1 hashes of each piece (20 bytes each)
+    for (std::size_t i = 0; i < decoded_torrent["info"]["pieces"].get<std::string>().length(); i += 20)
+    {
+        std::string piece = decoded_torrent["info"]["pieces"].get<std::string>().substr(i, 20);
+        std::stringstream ss;
+        for (unsigned char byte : piece)
+        {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)byte;
+        }
+        std::cout << ss.str() << std::endl;
+    }
+}
+
+std::string read_file(const std::string& filePath)
+{
+    /*
+    open the file
+    */
+    std::ifstream file(filePath, std::ios::binary);
+    std::stringstream buffer;
+
+    /*
+    read the content from the file
+    then close
+    */
+    if(file)
+    {
+        buffer << file.rdbuf();
+        file.close();
+        return buffer.str();
+    }
+    else
+    {
+        throw std::runtime_error("Failed to open file: " + filePath);
+    }
+}
+
+std::string json_to_bencode(const json& js)
+{
+    std::ostringstream os;
+    if (js.is_object())
+    {
+        os << 'd';
+        for (auto& el : js.items())
+        {
+            os << el.key().size() << ':' << el.key() << json_to_bencode(el.value());
+        }
+        os << 'e'; 
+    } 
+    else if (js.is_array())
+    {
+        os << 'l';
+        for (const json& item : js)
+        {
+            os << json_to_bencode(item);
+        }
+        os << 'e';
+    }
+    else if (js.is_number_integer())
+    {
+        os << 'i' << js.get<int>() << 'e';
+    }
+    else if (js.is_string())
+    {
+        const std::string& value = js.get<std::string>();
+        os << value.size() << ':' << value;
+    }
+    return os.str();
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -143,6 +244,27 @@ int main(int argc, char* argv[]) {
         std::string encoded_value = argv[2];
         json decoded_value = decode_bencoded_value(encoded_value);
         std::cout << decoded_value.dump() << std::endl;
+    }
+    else if (command == "info")
+    {
+        if (argc < 3) {
+            std::cerr << "Usage: " << argv[0] << " decode <encoded_value>" << std::endl;
+            return 1;
+        }
+        try
+        {
+            /*
+            retrieve the path to the torrent file
+            Example: /tmp/torrents586275342/itsworking.gif.torrent
+            */ 
+            std::string filePath = argv[2];
+
+            parse_torrent(filePath);
+        }
+        catch(const std::exception& e)
+        {
+            std::cerr << e.what() << '\n';
+        }
     } else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
