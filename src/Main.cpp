@@ -6,6 +6,7 @@
 #include <fstream>
 #include <array>
 #include <cstring>
+#include <algorithm>
 #include "curl/curl.h"
 #include <queue>
 #ifdef _WIN32
@@ -21,6 +22,8 @@ typedef SSIZE_T ssize_t; // Define ssize_t for Wind
 #endif
 #include "lib/nlohmann/json.hpp"
 #include "lib/sha1.hpp"
+
+#define my_min(a,b) (((a) < (b)) ? (a) : (b))
 
 using json = nlohmann::json;
 
@@ -243,9 +246,9 @@ std::string calculateInfohash(std::string bencoded_info)
 
 struct BlockRequest
 {
-    int piece_index;
-    int offset;
-    size_t length;
+    size_t piece_index;
+    size_t offset;
+    size_t blockSize;
 };
 
 auto parse_torrent_file(const std::string& filePath) {
@@ -560,7 +563,7 @@ std::vector<uint8_t> download_piece(int sockfd, size_t pieceIndex, size_t pieceL
 
     while (remaining > 0 || !pendingRequests.empty()) {
         while (pendingRequests.size() < 20 && remaining > 0) {
-            size_t blockSize = std::min(PIECE_BLOCK, remaining);
+            size_t blockSize = my_min(PIECE_BLOCK, remaining);
             request_block(sockfd, pieceIndex, offset, blockSize);
             pendingRequests.push_back({pieceIndex, offset, blockSize});
             offset += blockSize;
@@ -654,7 +657,7 @@ std::vector<uint8_t> download_file(const std::string& trackerURL, const std::str
         //     // continue;
         // }
 
-        std::cout << "Peer has the requested piece. Initiating download..." << std::endl;
+        std::cout << "Peer has the requested piece. Starting download" << std::endl;
 
         // Send interested message
         send_message(sockfd, MessageType::interested);
@@ -675,7 +678,8 @@ std::vector<uint8_t> download_file(const std::string& trackerURL, const std::str
             std::vector<uint8_t> pieceData = download_piece(sockfd, piece_index, pieceLength, totalPieces, length, pieceHashes);
 
             // Write piece to disk
-            std::copy(pieceData.begin(), pieceData.end(), fullFileData.begin() + piece_index * pieceLength);;
+            std::copy(pieceData.begin(), pieceData.end(), fullFileData.begin() + piece_index * pieceLength);
+            std::cout << "Downloaded " << pieceLength << " bytes" << std::endl;
             std::cout << "Piece " << (piece_index + 1) << "/" << totalPieces << " downloaded successfully" << std::endl;
         }
         closesocket(sockfd);
@@ -904,6 +908,7 @@ int main(int argc, char* argv[]) {
         {
             auto [decoded_torrent, trackerURL, length, pieceLength, totalPieces, infoHash, pieceHashes] = parse_torrent_file(filePath);
 
+            std::cout << "File length: " << length << std::endl;
             std::vector<uint8_t> fullFileData = download_file(trackerURL, infoHash, length, pieceLength, totalPieces, pieceHashes);
 
             write_to_disk(fullFileData, argc, argv);
