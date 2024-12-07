@@ -57,6 +57,17 @@ json decode_bencoded_value(const std::string &encoded_value) {
 
 }
 
+json decode_bencoded_list(const std::string& encoded_value, size_t& index) {
+    index++;
+    json list = json::array();
+    while(encoded_value[index] != 'e')
+    {
+        list.push_back(decode_bencoded_value(encoded_value, index));
+    }
+    index++;
+    return list;
+}
+
 json decode_bencoded_value(const std::string& encoded_value, size_t& index)
 {
     if (std::isdigit(encoded_value[index]))
@@ -72,7 +83,7 @@ json decode_bencoded_value(const std::string& encoded_value, size_t& index)
     else if (encoded_value[index] == 'l')
     {
         // Example: "l10:strawberryi559ee" -> "[strawberry, 559]"
-        // return decode_bencoded_list(encoded_value, index);
+        return decode_bencoded_list(encoded_value, index);
     }
     else if (encoded_value[index] == 'd')
     {
