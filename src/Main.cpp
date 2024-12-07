@@ -7,6 +7,18 @@
 #include <array>
 #include <cstring>
 #include "curl/curl.h"
+#include <queue>
+#ifdef _WIN32
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t; // Define ssize_t for Wind
+#else
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#define closesocket close
+#endif
 #include "lib/nlohmann/json.hpp"
 #include "lib/sha1.hpp"
 
@@ -254,6 +266,16 @@ std::vector<unsigned char> hexToBytes(const std::string& hex) {
     return bytes;
 }
 
+std::string bytes_to_hex(const std::string &bytes) {
+    std::ostringstream hex;
+    hex.fill('0');
+    hex << std::hex;
+    for (unsigned char c : bytes) {
+        hex << std::setw(2) << static_cast<int>(c);
+    }
+    return hex.str();
+}
+
 // Function to encode info_hash in URL-encoded format
 std::string url_encode(const std::string& value) {
     auto rawBytes = hexToBytes(value);
@@ -335,6 +357,139 @@ std::vector<std::string> request_peers(const std::string& trackerURL, const std:
     return parse_peers(decodedResponse["peers"]);
 }
 
+// Establish connection to the peer
+int connect_to_peer(const std::string &ip, int port) {
+    #ifdef _WIN32
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return -1;
+    }
+    #endif
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("Socket creation failed");
+        return -1;
+    }
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(port);
+    serverAddr.sin_addr.s_addr = inet_addr(ip.c_str());
+
+    if (connect(sockfd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
+        closesocket(sockfd);
+        throw std::runtime_error("Failed to connect to peer");
+    }
+
+    return sockfd;
+}   
+
+// Convert hexadecimal to binary (for InfoHash)
+std::string hex_to_binary(const std::string& hex) {
+    if (hex.size() != 40) {
+        throw std::runtime_error("Invalid SHA1 hash length; expected 40 hex characters.");
+    }
+
+    std::string binary;
+    binary.reserve(20); // 40 hex characters = 20 bytes binary
+
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        // Convert each pair of hex characters to a single byte
+        unsigned char byte = std::stoul(hex.substr(i, 2), nullptr, 16);
+        binary.push_back(static_cast<char>(byte));
+    }
+
+    return binary;
+}
+
+struct Handshake
+{
+    uint8_t length;
+    char protocol[19];
+    uint8_t reservedBytes[8];
+    char infoHash[20];
+    char peerID[20];
+
+    Handshake(const std::string& infoHashS, const std::string& peerIDS)
+    {
+        length = 19;
+        std::memcpy(protocol, "BitTorrent protocol", 19);
+        std::memset(reservedBytes, 0, 8);
+        std::memcpy(infoHash, infoHashS.data(), 20);
+        std::memcpy(peerID, peerIDS.data(), 20);
+    }
+
+    std::vector<char> toVector() const {
+        std::vector<char> handshakeVector(sizeof(Handshake), 0);
+        std::memcpy(handshakeVector.data(), this, sizeof(Handshake));
+
+        return handshakeVector;
+    }
+};
+
+std::vector<uint8_t> receive_message(int sockfd)
+{
+    // Read message length (4 bytes)
+    uint32_t length = 0;
+    // std::cout << "Message length: " << length << std::endl;
+    if (recv(sockfd, reinterpret_cast<char*>(&length), sizeof(length), 0) != sizeof(length)) // failed after downloading some blocks, but why?
+    {
+        throw std::runtime_error("Failed to read message");
+    }
+    length = ntohl(length);
+
+    // Read the payload (can ignore this for now)
+    std::vector<uint8_t> buffer(length);
+
+    int totalBytesRead = 0;
+    while (totalBytesRead < length) {
+        int bytesRead = recv(sockfd, reinterpret_cast<char*>(buffer.data() + totalBytesRead), length - totalBytesRead, 0);
+        if (bytesRead <= 0) {
+            throw std::runtime_error("Failed to read payload: Connection lost or incomplete data");
+        }
+        totalBytesRead += bytesRead;
+    }
+    return buffer;
+}
+
+std::pair<std::string, int> parse_peer_info(const std::string& peerInfo) {
+    size_t colonIndex = peerInfo.find(':');
+    if (colonIndex == std::string::npos) {
+        throw std::runtime_error("Invalid peer address format");
+    }
+
+    std::string peerIP = peerInfo.substr(0, colonIndex);
+    int peerPort = std::stoi(peerInfo.substr(colonIndex + 1));
+    return {peerIP, peerPort};
+}
+
+void perform_handshake(int sockfd, const std::vector<char>& handshakeMessage, const std::string& binaryInfoHash) {
+    if (send(sockfd, handshakeMessage.data(), handshakeMessage.size(), 0) == -1) {
+        throw std::runtime_error("Failed to send handshake message");
+    }
+
+    char response[68];
+    ssize_t bytesRead = recv(sockfd, response, sizeof(response), 0);
+    if (bytesRead != 68 || std::string(response + 28, 20) != binaryInfoHash) {
+        throw std::runtime_error("Invalid handshake response");
+    }
+    // Step 4: Validate the handshake response
+    std::string received_infohash = std::string(response, 68).substr(28, 20);
+    if (received_infohash != binaryInfoHash) {
+        throw std::runtime_error("Invalid handshake response: Infohash mismatch");
+    }
+    std::cout << "Handshake established" << std::endl;
+    /*
+    Remember to convert back to hexadecimal for human readable output
+    Prints the hexadecimal value of the Peer ID of the Peer that we (the client) connected to
+    Example: received_peer_id: 3030313132323333343435353636373738383939 -> peer_id: 116494218e909827af98a36137026979dabbdcb9
+    */
+    std::string receivedPeerID(std::string(response, 68).substr(48, 20));
+    std::cout << "Peer ID: " << bytes_to_hex(receivedPeerID) << std::endl;
+}
+
 int main(int argc, char* argv[]) {
     // Flush after every std::cout / std::cerr
     std::cout << std::unitbuf;
@@ -405,7 +560,57 @@ int main(int argc, char* argv[]) {
             std::cerr << e.what() << '\n';
             return 1;
         }
-    } else {
+    
+    } 
+    else if (command == "handshake")
+    {
+        std::string filePath = argv[2];
+        try
+        {
+            std::string peerInfo = argv[3];
+            auto [peerIP, peerPort] = parse_peer_info(peerInfo);
+
+            // read the file 
+            // bencode the torrent
+            std::string fileContent = read_file(filePath);
+            json decoded_torrent = decode_bencoded_value(fileContent);
+            std::string bencoded_info = json_to_bencode(decoded_torrent["info"]);
+            
+            // calculate the info hash
+            std::string infoHash = calculateInfohash(bencoded_info);
+            // std::cout << binaryInfoHash << std::endl;
+
+            // Peer ID of YOUR client
+            std::string peerID = "00112233445566778899";
+
+            /*
+            1. length of the protocol string (BitTorrent protocol) which is 19 (1 byte)
+
+            2. the string BitTorrent protocol (19 bytes)
+
+            3. eight reserved bytes, which are all set to zero (8 bytes)
+
+            4. sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
+
+            5. peer id (20 bytes) (generate 20 random byte values)
+            */
+            Handshake handshake(hex_to_binary(infoHash), peerID);
+            std::vector<char> handshakeMessage = handshake.toVector();
+
+            // Step 1: Establish TCP connection with the peer
+            int sockfd = connect_to_peer(peerIP, peerPort);
+
+            perform_handshake(sockfd, handshakeMessage, hex_to_binary(infoHash));
+
+            // close the socket
+            closesocket(sockfd);
+        }
+        catch(const std::exception& e)
+        {
+            std::cerr << e.what() << '\n';
+        }
+    }
+    else {
         std::cerr << "unknown command: " << command << std::endl;
         return 1;
     }
