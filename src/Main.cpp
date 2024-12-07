@@ -241,6 +241,13 @@ std::string calculateInfohash(std::string bencoded_info)
     return infoHash;
 }
 
+struct BlockRequest
+{
+    int piece_index;
+    int offset;
+    size_t length;
+};
+
 auto parse_torrent_file(const std::string& filePath) {
     std::string fileContent = read_file(filePath);
     json decodedTorrent = decode_bencoded_value(fileContent);
@@ -429,6 +436,21 @@ struct Handshake
     }
 };
 
+const size_t PIECE_BLOCK = 16384; //16 kb
+
+enum MessageType : uint8_t 
+{
+    choke = 0,
+    unchoke = 1,
+    interested = 2,
+    not_interested = 3,
+    have = 4,
+    bitfield = 5,
+    request = 6,
+    piece = 7,
+    cancel = 8
+};
+
 std::vector<uint8_t> receive_message(int sockfd)
 {
     // Read message length (4 bytes)
@@ -452,6 +474,42 @@ std::vector<uint8_t> receive_message(int sockfd)
         totalBytesRead += bytesRead;
     }
     return buffer;
+}
+
+void send_message(int sockfd, MessageType messageType, const std::vector<uint8_t>& payload = {})
+{
+    uint32_t length = htonl(payload.size() + 1);
+    send(sockfd, reinterpret_cast<char*>(&length), sizeof(length), 0);
+    uint8_t id = static_cast<uint8_t>(messageType);
+    send(sockfd, reinterpret_cast<char*>(&id), sizeof(id), 0);
+    if (!payload.empty())
+    {
+        send(sockfd, reinterpret_cast<const char*>(payload.data()), payload.size(), 0);
+    }
+}
+
+void request_block(int sockfd, int index, int begin, int length)
+{
+    std::vector<uint8_t> payload(12);   
+    uint32_t index_n = htonl(index);    //Piece index
+    uint32_t begin_n = htonl(begin);    //Block start offset
+    uint32_t length_n = htonl(length);  //Block length
+
+    // All later integers sent in the protocol are encoded as four bytes big-endian.
+    std::memcpy(&payload[0], &index_n, 4);
+    std::memcpy(&payload[4], &begin_n, 4);
+    std::memcpy(&payload[8], &length_n, 4);
+    send_message(sockfd, MessageType::request, payload);
+}
+
+// Utility function to parse command-line arguments
+std::string get_output_file(int argc, char* argv[]) {
+    for (int i = 1; i < argc - 1; ++i) {
+        if (std::string(argv[i]) == "-o") {
+            return std::string(argv[i + 1]);
+        }
+    }
+    throw std::runtime_error("Output file not specified. Use the -o option.");
 }
 
 std::pair<std::string, int> parse_peer_info(const std::string& peerInfo) {
@@ -488,6 +546,67 @@ void perform_handshake(int sockfd, const std::vector<char>& handshakeMessage, co
     */
     std::string receivedPeerID(std::string(response, 68).substr(48, 20));
     std::cout << "Peer ID: " << bytes_to_hex(receivedPeerID) << std::endl;
+}
+
+std::vector<uint8_t> download_piece(int sockfd, size_t pieceIndex, size_t pieceLength, size_t totalPieces, size_t length, const std::string& pieceHashes) {
+    size_t currentPieceSize = (pieceIndex == totalPieces - 1)
+                              ? length % pieceLength
+                              : pieceLength;
+    currentPieceSize = (currentPieceSize == 0) ? pieceLength : currentPieceSize;
+
+    size_t remaining = currentPieceSize, offset = 0;
+    std::vector<uint8_t> pieceData(currentPieceSize);
+    std::deque<BlockRequest> pendingRequests;
+
+    while (remaining > 0 || !pendingRequests.empty()) {
+        while (pendingRequests.size() < 20 && remaining > 0) {
+            size_t blockSize = std::min(PIECE_BLOCK, remaining);
+            request_block(sockfd, pieceIndex, offset, blockSize);
+            pendingRequests.push_back({pieceIndex, offset, blockSize});
+            offset += blockSize;
+            remaining -= blockSize;
+        }
+
+        std::vector<uint8_t> message = receive_message(sockfd);
+        if (message[0] != MessageType::piece) {
+            throw std::runtime_error("Expected piece message");
+        }
+
+        int index = ntohl(*reinterpret_cast<int*>(&message[1]));
+        int begin = ntohl(*reinterpret_cast<int*>(&message[5]));
+        const uint8_t* block = &message[9];
+        int blockLength = message.size() - 9;
+
+        auto it = std::find_if(pendingRequests.begin(), pendingRequests.end(), [&](const BlockRequest& req) {
+            return req.piece_index == index && req.offset == begin;
+        });
+
+        if (it == pendingRequests.end()) {
+            throw std::runtime_error("Unexpected block received");
+        }
+
+        std::memcpy(&pieceData[it->offset], block, blockLength);
+        pendingRequests.erase(it);
+    }
+
+    // Verify piece hash
+    std::string pieceHash = calculateInfohash(std::string(pieceData.begin(), pieceData.end()));
+    std::string expectedPieceHash(pieceHashes.begin() + pieceIndex * 20, pieceHashes.begin() + (pieceIndex + 1) * 20);
+    if (hex_to_binary(pieceHash) != expectedPieceHash) {
+        throw std::runtime_error("Piece hash mismatch");
+    }
+
+    return pieceData;
+}
+
+void write_to_disk(const std::vector<uint8_t>& fullFileData, int argc, char** argv) {
+    std::string outputFile = get_output_file(argc, argv);
+    std::ofstream ofs(outputFile, std::ios::binary);
+
+    if (!ofs || !ofs.write(reinterpret_cast<const char*>(fullFileData.data()), fullFileData.size())) {
+        throw std::runtime_error("Failed to write data to output file: " + outputFile);
+    }
+    std::cout << "File written to " << outputFile << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -604,6 +723,96 @@ int main(int argc, char* argv[]) {
 
             // close the socket
             closesocket(sockfd);
+        }
+        catch(const std::exception& e)
+        {
+            std::cerr << e.what() << '\n';
+        }
+    }
+    else if (command == "download_piece")
+    {
+        std::string filePath = argv[4];
+        try
+        {
+            auto [decoded_torrent, trackerURL, length, pieceLength, totalPieces, infoHash, pieceHashes] = parse_torrent_file(filePath);
+
+            std::string peerID = "01234567890123456789";
+            // Perform the tracker GET request to get a list of peers
+            // parse the peers and print them
+            std::vector<std::string> peerList = request_peers(trackerURL, infoHash, peerID, length);
+
+            // Establish a TCP connection with a peer, and perform a handshake
+            Handshake handshake(hex_to_binary(infoHash), peerID);
+            std::vector<char> handshakeMessage = handshake.toVector();
+            
+            if (peerList.empty()) {
+                throw std::runtime_error("No peers available for connection");
+            }           
+
+            // Piece index from command line
+            // "./your_bittorrent.sh download_piece -o /tmp/test-piece sample.torrent <piece_index>"
+            int piece_index = std::stoi(argv[5]);
+            std::string peerInfo = peerList[0];
+            // for (const auto& peerInfo : peerList)
+            // {
+            try
+            {
+                auto [peerIP, peerPort] = parse_peer_info(peerInfo);
+
+                // Step 1: Establish TCP connection with the peer
+                int sockfd = connect_to_peer(peerIP, peerPort);
+
+                perform_handshake(sockfd, handshakeMessage, hex_to_binary(infoHash));
+
+                // Exchange multiple peer messages to download the file
+                // TODO
+                // Receive bitfield message
+                std::vector<uint8_t> bitfield = receive_message(sockfd);
+                if (bitfield[0] != MessageType::bitfield)
+                {
+                    throw std::runtime_error("Expected bitfield message");
+                }
+
+                int byteIndex = piece_index / 8;
+                int bitIndex = piece_index % 8;
+                if (byteIndex >= bitfield.size() - 1 || !(bitfield[byteIndex + 1] & (1 << (7 - bitIndex)))) {
+                    std::cout << "Peer does not have the requested piece" << std::endl;
+                    closesocket(sockfd);
+                    // continue;
+                }
+
+                std::cout << "Peer has the requested piece. Initiating download..." << std::endl;
+
+                // Send interested message
+                send_message(sockfd, MessageType::interested);
+
+                // Receive unchoke message
+                std::vector<uint8_t> unchoke = receive_message(sockfd);
+                if (unchoke[0] != MessageType::unchoke)
+                {
+                    throw std::runtime_error("Expected unchoke message");
+                }
+
+                // Send request message
+                // Divide piece into blocks and request each blocks
+                // Receive piece message for each block requested
+                // Note: INDEX ALWAYS STARTS FROM ZERO, DO NOT FORGET THIS
+                std::vector<uint8_t> pieceData = download_piece(sockfd, piece_index, pieceLength, totalPieces, length, pieceHashes);
+
+                // Write piece to disk
+                std::ofstream output(argv[3]);
+                output.write(reinterpret_cast<const char*>(pieceData.data()), pieceData.size());
+                output.close();
+
+                std::cout << "Piece downloaded successfully" << std::endl;
+                closesocket(sockfd);
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "Error with peer: " << e.what() << std::endl;
+                // continue;
+            }
+            // }
         }
         catch(const std::exception& e)
         {
